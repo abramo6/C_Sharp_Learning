@@ -1,0 +1,180 @@
+//This is a class to compute par yield method of funds transfer pricing calculation. 
+//Uses the secant method to iteratively derive the coupon of the FTP contract that puts it at par
+//Possible enhancement to be made: vectorialize the for loops in order to enhance performance
+
+using System;
+
+public enum RateFormat
+{
+MoneyMarket,
+Zero
+}
+
+//Function used to accrue interest. The formula depends on the RateFormat used.
+//public delegate double accrue(double principal, int days, double rate);
+//Replaced by a Func<> in this code, so no delegate declaration required
+
+
+public class MainClass
+{
+		public static void Main()
+	{
+		
+		Console.WriteLine("with MM rate: {0}", ParYielderClass.ParYielder()); //This always finds the result in the first iteration, because the present value of the bond is linear on the FTP rate if Money Market rates are used.
+		Console.WriteLine("with Zero rate: {0}", ParYielderClass.ParYielder(RateFormat.Zero)); //this one takes some iterations to arrive at the value
+	}
+	
+}
+
+
+public class ParYielderClass
+{
+	//Those private readonly properties are the default values in case the user does not provide them. The values are selected to reflect a PoC done in BDI, so that I could validate the final answer.
+	
+	//DiscountMMCurve are the interest rates used to discount the cashflows, in Money Market convention. Each value corresponds to one of the principal cashflows of the instrument.
+	static private double[] defaultDiscountMMCurve {get;} = {0.00435124222432819, 0.00597233338408689, 0.00757580398776126, 0.00919689514751996, 0.0107915554731522, 0.0124126466329109, 0.0140073069585431, 0.0156283981183017, 0.0172230584439339, 0.0188441496036926};
+	
+	//DaysDiscounted are the number of days that each coupon cashflows accrues, relative to last coupon payment. In this demo, this same vector is used for principal cashflows (that is, principal and coupon cashflows coincide)
+	static private int[] defaultDaysDiscounted {get;} = {181, 184, 182, 184, 181, 184, 181, 184, 181, 184};
+	
+	//PrincipalCashflows are the amortizing payments, in the order they are made
+	static private double[] defaultPrincipalCashFlows {get;} = {100000, 100000, 100000, 100000, 100000, 100000, 100000, 100000, 100000, 100000};
+	
+	//Precision for the iterative function. It relates to bond value at par (that is, how much should the maximum difference be between discounted cashflows and par value), not the precision in the resulting FTP value. It is a lot more precise than FTP value.
+	static private double defaultPrecision {get;} = 0.00000001;
+	
+	//Maximum evaluations used in the iterative method.
+	static private int defaultMaximumEvals {get;} = 10;
+	
+	//Default rate format for the returning FTP rate
+	static private RateFormat defaultRateFormat {get;} = RateFormat.MoneyMarket;
+	
+	//Function used to accrue interests in Money Market convention, using act/360 convention
+	public static double accrueMoneyMarket(double principal, int days, double rate)
+	{
+		return principal * days / 360 * rate;
+	}
+	
+	//Function used to accrue interests in Zero convention, using act/360 convention
+	public static double accrueZero(double principal, int days, double rate)
+	{
+		return principal * ( Math.Pow(1 + rate, (double) days / 360 )-1); //had to do a type cast otherwise days/360 would result 0
+	}
+	
+	//Parameterless version of the method. Uses default values for everything
+	static public double ParYielder()
+	{
+		return ParYielder(defaultDiscountMMCurve, defaultDaysDiscounted, defaultPrincipalCashFlows, defaultMaximumEvals, defaultPrecision, defaultRateFormat);
+	}
+	
+	//Only one parameter: the rate format of the result.
+	static public double ParYielder(RateFormat rateformat)
+	{
+		return ParYielder(defaultDiscountMMCurve, defaultDaysDiscounted, defaultPrincipalCashFlows, defaultMaximumEvals, defaultPrecision, rateformat);
+	}
+	
+	//Complete version of the method.
+		static public double ParYielder(double[] discountMMCurve, int[] daysDiscounted, double[] principalCashflows, int maximumEvals, double precision, RateFormat rateformat)
+	{
+		//uses secant method for iteratively approaching the root of function y = "FTP bond value" - "Par value"
+		
+		//
+		double previousvpBond; //Value of the FTP bond in previous iteration
+		double previousFTPRate = 0; //FTP rate of previous iteration. first guess at FTP rate = 0%
+		double FTPRate = 0.01; //FTP rate of current iteration. Second guess at FTP rate = 1% (secant method requires 2 initial guesses)
+		double[] interest = new double[discountMMCurve.Length]; //Vector for the interest payments of the FTP bond
+		double[] princPlusInterest = new double[discountMMCurve.Length]; //Vector containing whole cashflow (principal + interests) for each payment
+		double[] pvCashFlows = new double[discountMMCurve.Length]; //Vector holding discounted (PV) value of FTP cashflows.
+		double pvFTPBond; //Present value of FTP bond - this is what iteratively approaches par
+		double tempTransferFTPRate; //temporary variable used for holding current iteration's FTP rate, so that it can be copied to previousFTPRate
+		double f; //f = pvFTPBond - principalOutstanding[0] - this is the value that needs to approach 0
+		double previousf; //Previous iteration's value of f
+		int[] daysAccum = new int[daysDiscounted.Length]; //Cumulative days. Used for discounting each cashflow to get; its present value.
+		int daysAccIterator = 0; //Temporary variable used for calculating the daysAccum[] variable from the daysDiscounted[] vector
+		double[] principalOutstanding = new double[discountMMCurve.Length]; //Vector holding the principal used for accruing interests in the FTP bond
+		double princAccum = 0; //Temporary variable used for deriving the principalOutstanding[] vector from the principalCashflows[] vector
+		Func<double, int, double, double> Accrue; //function used to accrue interest for each cashflow
+		
+		//Now to determine which function should be used for accruing interests:
+		switch (rateformat)
+		{
+			case RateFormat.Zero:
+				{
+					Accrue = accrueZero;
+					break;
+				}
+			default:
+				{
+					Accrue = accrueMoneyMarket;
+					break;
+				}
+
+		}
+
+		
+		//calculates DaysAccum[]
+		for (int i = 0; i < daysDiscounted.Length; i++)
+		{
+			daysAccIterator += daysDiscounted[i];
+			daysAccum[i] = daysAccIterator;
+		}
+		
+		//calculates principalOutstanding[]
+		for(int i = 0; i < principalOutstanding.Length; i++)
+		{
+			//goes backwards from last principal payment to the first
+		    princAccum += principalCashflows[principalOutstanding.Length - i - 1];
+		    principalOutstanding[principalOutstanding.Length - i - 1] = princAccum;
+		}
+
+		//first calculates the first guess at the FTPRate (previousFTPRate, previousvpBond):
+		previousvpBond = 0;
+		for (int i = 0; i < interest.Length; i++)
+		{
+			interest[i] = Accrue(principalOutstanding[i], daysDiscounted[i], previousFTPRate); //calculates interest on the FTP bond
+			princPlusInterest[i] = interest[i] + principalCashflows[i]; //P+I payment vector
+			pvCashFlows[i] = princPlusInterest[i] / (1 + discountMMCurve[i] * daysAccum[i] / 360); //Discounts each cashflow with the corresponding MM rate from the curve
+			previousvpBond += pvCashFlows[i];
+		}
+
+		previousf = previousvpBond - principalOutstanding[0]; //holds previous iteration of f. PrincipalOutstanding[0] = par value
+		if (Math.Abs(previousf) < precision)
+		{
+			Console.WriteLine("Nice guess!", previousvpBond, previousf);
+			return previousFTPRate;
+		}
+
+		//now calculates the iterative method, using parting from second guess of FTP Rate
+		for (int iteration = 0; iteration < maximumEvals; iteration++)
+		{
+			Console.WriteLine("Iteration: {0}", iteration);
+			Console.WriteLine("FTP: {0}", FTPRate);
+			pvFTPBond = 0;
+			for (int i = 0; i < interest.Length; i++)
+			{
+				interest[i] = Accrue(principalOutstanding[i], daysDiscounted[i], FTPRate); //same thing as with first guess
+				princPlusInterest[i] = interest[i] + principalCashflows[i];
+				pvCashFlows[i] = princPlusInterest[i] / (1 + discountMMCurve[i] * daysAccum[i] / 360);
+				pvFTPBond += pvCashFlows[i];
+			}
+
+			f = pvFTPBond - principalOutstanding[0]; //current iteration's f
+			if (Math.Abs(f) < precision || f == previousf )
+			{
+				return FTPRate;
+			}
+			else
+			{
+				tempTransferFTPRate = FTPRate;
+				FTPRate = FTPRate - f * (FTPRate - previousFTPRate) / (f - previousf); //creates next guess at FTP rate, using Secant method
+				previousFTPRate = tempTransferFTPRate; //updates previous iteration's FTP rate
+				previousf = f; //updates previous iteration's f
+				Console.WriteLine("Current guess: {0}", FTPRate);
+			}
+		}
+
+		Console.WriteLine("Couldn't find the answer :(");
+		Console.WriteLine("Returning last iteration's FTP rate");
+		return FTPRate;
+	}
+}
